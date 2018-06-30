@@ -12,10 +12,46 @@
 #include <netdb.h>
 
 #include <iostream>
+#include <iomanip>
+#include <string_view>
 
 using namespace std;
 
 #define PORT_NUMBER 5001
+static std::string filesizeReadableArray[] = {"b", "KiB", "MiB", "GiB", "TiB"};
+
+// C++ with it's crappy string manipulation tools... This is merely to get 2 decimal precision in the filesize.
+template <typename T>
+std::string to_string(const T val, const int prec)
+{
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(prec) << val;
+  return os.str();
+}
+
+std::pair<int, double> filesize(const uint64_t size)
+{
+  double newSize = size;
+  int index = 0;
+  while (newSize > 1024)
+  {
+    newSize /= 1024;
+    index++;
+  }
+
+  return std::make_pair(index, newSize);
+}
+
+std::string filesizeString(const uint64_t size)
+{
+  auto [index, newSize] = filesize(size);
+  return to_string(newSize, 2) + " " + filesizeReadableArray[index];
+}
+
+std::string_view filename(const std::string_view &fullFileName)
+{
+  return fullFileName.substr(fullFileName.find_last_of('/') + 1);
+}
 
 //---------------------------------------------------------------------------
 #define BUFFER_SIZE (4 * 1024)
@@ -181,7 +217,7 @@ int server_start()
 //---------------------------------------------------------------------------
 void print_usage()
 {
-  cout << "Usage: netsplice <mode> receive fileout" << endl;
+  cout << "Usage: netsplice <mode> receive [fileout]" << endl;
   cout << "       netsplice <mode> send localhost filein" << endl;
   cout << "       netsplice <mode> copy filein fileout" << endl;
   cout << endl;
@@ -202,7 +238,7 @@ int main(int argc, char *argv[])
 
   cout << "netsplice - simple application for transferring files" << endl;
 
-  if (argc < 4)
+  if (argc < 3)
   {
     print_usage();
     return -1;
@@ -222,7 +258,7 @@ int main(int argc, char *argv[])
   string sAction = argv[2];
   if (sAction == "receive")
   {
-    if (argc != 4)
+    if (argc < 3)
     {
       print_usage();
       return -1;
@@ -239,7 +275,27 @@ int main(int argc, char *argv[])
     // Get the filesize from the client
     read(fd_filein, &filesize, sizeof(filesize));
 
-    fd_fileout = open(argv[3], O_WRONLY | O_CREAT, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    // Get the filename length
+    std::size_t filenameLength = 0;
+    read(fd_filein, &filenameLength, sizeof(filenameLength));
+
+    // Pre-allocate a string of the filename length. Will be filled in the read command.
+    std::string name(filenameLength, ' ');
+    read(fd_filein, name.data(), filenameLength);
+
+    if (argc >= 4)
+    {
+      name = std::string(argv[3]);
+      std::cout << "Using filename provided in command argument: " << name;
+    }
+    else
+    {
+      std::cout << "No filename provided in command argument, using the received filename: " << name;
+    }
+
+    std::cout << std::endl;
+
+    fd_fileout = open(name.data(), O_WRONLY | O_CREAT, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 
     if (fd_fileout < 0)
     {
@@ -265,6 +321,7 @@ int main(int argc, char *argv[])
 
     fstat(fd_filein, &sb);
     filesize = sb.st_size;
+
     cout << "filesize: " << filesize << endl;
 
     fd_fileout = client_start(argv[3]);
@@ -277,6 +334,14 @@ int main(int argc, char *argv[])
 
     // Tell the server what we are about to send
     write(fd_fileout, &filesize, sizeof(filesize));
+
+    std::string_view name = filename(argv[4]);
+    std::size_t filenameLength = name.length();
+    std::cout << "filename: " << name << std::endl;
+
+    // Tell the server the filename we're about to give it. If the server doesn't supply a filename, this value will be used.
+    write(fd_fileout, &filenameLength, sizeof(filenameLength)); // Tells the client how much characters the filename is
+    write(fd_fileout, name.data(), filenameLength); // And the actual filename data.
   }
   else if (sAction == "copy")
   {
@@ -313,7 +378,7 @@ int main(int argc, char *argv[])
   }
 
   cout << "starting " << sMode << " " << sAction << " of "
-       << (filesize / (1024 * 1024)) << "MiB" << endl;
+       << filesize << " bytes (" << filesizeString(filesize) << ")" << endl;
 
   if (sMode == "rw")
   {
@@ -328,7 +393,7 @@ int main(int argc, char *argv[])
     transferred = sendfile_splice(fd_fileout, fd_filein, filesize);
   }
 
-  cout << " - Done " << (transferred / (1024 * 1024)) << "MiB" << endl;
+  cout << " - Done " << filesize << " bytes (" << filesizeString(filesize) << ")" << endl;
 
   close(fd_fileout);
   close(fd_filein);
