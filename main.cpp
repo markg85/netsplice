@@ -8,12 +8,16 @@
 #include <string.h>
 
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
+#include <errno.h>
 
 #include <iostream>
 #include <iomanip>
 #include <string_view>
+#include <vector>
 
 using namespace std;
 
@@ -53,16 +57,40 @@ std::string_view filename(const std::string_view &fullFileName)
   return fullFileName.substr(fullFileName.find_last_of('/') + 1);
 }
 
+void setSocketOptions(int connection)
+{
+  /*
+  int flag = 1;
+  if (setsockopt(connection, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) == -1)
+  {
+    perror("setsockopt(TCP_NODELAY=1)");
+  }
+
+  int corkFlag = 1;
+  if (setsockopt(connection, IPPROTO_TCP, TCP_CORK, &corkFlag, sizeof(corkFlag)) == -1)
+  {
+    perror("setsockopt(TCP_CORK=1)");
+  }
+
+  int quickAckFlag = 1;
+  if (setsockopt(connection, IPPROTO_TCP, TCP_QUICKACK, (char *) &quickAckFlag, sizeof(int) == -1))
+  {
+    perror("setsockopt(TCP_QUICKACK=1)");
+    std::cout << strerror(errno) << "\n";
+  }
+  */
+}
+
 //---------------------------------------------------------------------------
 #define BUFFER_SIZE (4 * 1024)
-size_t sendfile_rw(int fd_dst, int fd_src, size_t n)
+uint64_t sendfile_rw(int fd_dst, int fd_src, uint64_t n)
 {
   char *buffer[BUFFER_SIZE];
-  size_t bytes_left = n;
+  uint64_t bytes_left = n;
 
   while (bytes_left > 0)
   {
-    size_t block_size = (bytes_left < BUFFER_SIZE) ? bytes_left : BUFFER_SIZE;
+    uint64_t block_size = (bytes_left < BUFFER_SIZE) ? bytes_left : BUFFER_SIZE;
 
     if (read(fd_src, buffer, block_size) < 0)
     {
@@ -83,14 +111,14 @@ size_t sendfile_rw(int fd_dst, int fd_src, size_t n)
 }
 
 //---------------------------------------------------------------------------
-size_t sendfile_sendfile(int fd_dst, int fd_src, size_t n)
+uint64_t sendfile_sendfile(int fd_dst, int fd_src, uint64_t n)
 {
-  size_t bytes_left = n;
+  uint64_t bytes_left = n;
   off_t offset = 0;
 
   while (bytes_left > 0)
   {
-    size_t block_size = sendfile(fd_dst, fd_src, &offset, bytes_left);
+    uint64_t block_size = sendfile(fd_dst, fd_src, &offset, bytes_left);
     bytes_left -= block_size;
   }
 
@@ -99,10 +127,10 @@ size_t sendfile_sendfile(int fd_dst, int fd_src, size_t n)
 
 //---------------------------------------------------------------------------
 #define MAX_SPLICE_SIZE (16 * 1024)
-size_t sendfile_splice(int fd_dst, int fd_src, size_t n)
+uint64_t sendfile_splice(int fd_dst, int fd_src, uint64_t n)
 {
   int pfd[2];
-  size_t bytes_left = n;
+  uint64_t bytes_left = n;
   // loff_t off1;
   // loff_t off2;
 
@@ -115,10 +143,10 @@ size_t sendfile_splice(int fd_dst, int fd_src, size_t n)
 
   while (bytes_left > 0)
   {
-    size_t block_size = (bytes_left < MAX_SPLICE_SIZE) ? bytes_left : MAX_SPLICE_SIZE;
+    uint64_t block_size = (bytes_left < MAX_SPLICE_SIZE) ? bytes_left : MAX_SPLICE_SIZE;
 
     // Splice to fd_src -> pipe
-    size_t splice_size = splice(fd_src, NULL, pfd[1], NULL, block_size, SPLICE_F_MOVE);
+    uint64_t splice_size = splice(fd_src, NULL, pfd[1], NULL, block_size, SPLICE_F_MOVE);
 
     if (splice_size == 0)
     {
@@ -168,6 +196,8 @@ int client_start(const char *hostname)
     return -1;
   }
 
+  setSocketOptions(sockfd);
+
   return sockfd;
 }
 
@@ -209,6 +239,8 @@ int server_start()
     return -1;
   }
 
+  setSocketOptions(newsockfd);
+
   cout << "Client connected" << endl;
 
   return newsockfd;
@@ -234,7 +266,7 @@ int main(int argc, char *argv[])
   int fd_fileout;
   struct stat sb;
   uint64_t filesize;
-  size_t transferred;
+  uint64_t transferred;
 
   cout << "netsplice - simple application for transferring files" << endl;
 
@@ -276,16 +308,17 @@ int main(int argc, char *argv[])
     read(fd_filein, &filesize, sizeof(filesize));
 
     // Get the filename length
-    std::size_t filenameLength = 0;
+    uint64_t filenameLength = 0;
     read(fd_filein, &filenameLength, sizeof(filenameLength));
 
     // Pre-allocate a string of the filename length. Will be filled in the read command.
-    std::string name(filenameLength, ' ');
-    read(fd_filein, name.data(), filenameLength);
+    std::vector<char> nameBuffer(filenameLength);
+    read(fd_filein, &nameBuffer[0], filenameLength);
+    std::string_view name(&nameBuffer[0], nameBuffer.size());
 
     if (argc >= 4)
     {
-      name = std::string(argv[3]);
+      name = std::string_view(argv[3]);
       std::cout << "Using filename provided in command argument: " << name;
     }
     else
@@ -293,7 +326,7 @@ int main(int argc, char *argv[])
       std::cout << "No filename provided in command argument, using the received filename: " << name;
     }
 
-    std::cout << std::endl;
+    std::cout << "\n";
 
     fd_fileout = open(name.data(), O_WRONLY | O_CREAT, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 
@@ -335,9 +368,12 @@ int main(int argc, char *argv[])
     // Tell the server what we are about to send
     write(fd_fileout, &filesize, sizeof(filesize));
 
-    std::string_view name = filename(argv[4]);
-    std::size_t filenameLength = name.length();
-    std::cout << "filename: " << name << std::endl;
+    std::string_view name(argv[4]);
+    uint64_t filenameLength = name.length();
+    std::cout << "filename: " << name << " length: " << filenameLength << "\n";
+
+    std::cout << "filesize obj bytes: " << sizeof(filesize) << "\n";
+    std::cout << "filename obj bytes: " << sizeof(filenameLength) << "\n";
 
     // Tell the server the filename we're about to give it. If the server doesn't supply a filename, this value will be used.
     write(fd_fileout, &filenameLength, sizeof(filenameLength)); // Tells the client how much characters the filename is
